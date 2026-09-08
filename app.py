@@ -2,6 +2,18 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from xgboost import XGBRegressor
+from io import BytesIO
+
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle
+)
 
 # ============================================================
 # PAGE CONFIGURATION
@@ -14,7 +26,7 @@ st.set_page_config(
 )
 
 # ============================================================
-# LOAD XGBOOST MODEL
+# LOAD MODEL
 # ============================================================
 
 @st.cache_resource
@@ -23,13 +35,14 @@ def load_model():
     model.load_model("concrete_strength_model.json")
     return model
 
+
 model = load_model()
 
 # ============================================================
-# MATERIAL COST ASSUMPTIONS
+# MATERIAL COST
 # ============================================================
 
-material_cost = {
+MATERIAL_COST = {
     "Cement": 7.0,
     "Blast Furnace Slag": 2.0,
     "Fly Ash": 2.0,
@@ -41,10 +54,9 @@ material_cost = {
 
 # ============================================================
 # CO2 FACTORS
-# Academic/project assumptions
 # ============================================================
 
-co2_factor = {
+CO2_FACTOR = {
     "Cement": 0.90,
     "Blast Furnace Slag": 0.07,
     "Fly Ash": 0.02,
@@ -55,24 +67,78 @@ co2_factor = {
 }
 
 # ============================================================
-# FUNCTIONS
+# PREDICT STRENGTH
+# ============================================================
+
+def predict_strength(mix, age):
+
+    data = pd.DataFrame({
+        "Cement": [mix["Cement"]],
+        "Blast Furnace Slag": [mix["Blast Furnace Slag"]],
+        "Fly Ash": [mix["Fly Ash"]],
+        "Water": [mix["Water"]],
+        "Superplasticizer": [mix["Superplasticizer"]],
+        "Coarse Aggregate": [mix["Coarse Aggregate"]],
+        "Fine Aggregate": [mix["Fine Aggregate"]],
+        "Age": [age]
+    })
+
+    return float(model.predict(data)[0])
+
+
+# ============================================================
+# BATCH PREDICTION
+# ============================================================
+
+def predict_candidates(candidates, age):
+
+    data = candidates[
+        [
+            "Cement",
+            "Blast Furnace Slag",
+            "Fly Ash",
+            "Water",
+            "Superplasticizer",
+            "Coarse Aggregate",
+            "Fine Aggregate"
+        ]
+    ].copy()
+
+    data["Age"] = age
+
+    return model.predict(data)
+
+
+# ============================================================
+# COST CALCULATION
 # ============================================================
 
 def calculate_cost(mix):
+
     return sum(
-        mix[name] * material_cost[name]
-        for name in material_cost
+        mix[name] * MATERIAL_COST[name]
+        for name in MATERIAL_COST
     )
 
+
+# ============================================================
+# CO2 CALCULATION
+# ============================================================
 
 def calculate_co2(mix):
+
     return sum(
-        mix[name] * co2_factor[name]
-        for name in co2_factor
+        mix[name] * CO2_FACTOR[name]
+        for name in CO2_FACTOR
     )
 
 
+# ============================================================
+# MIX PROPERTIES
+# ============================================================
+
 def calculate_properties(mix):
+
     binder = (
         mix["Cement"]
         + mix["Blast Furnace Slag"]
@@ -86,204 +152,562 @@ def calculate_properties(mix):
 
     total_mass = sum(
         mix[name]
-        for name in material_cost
+        for name in MATERIAL_COST
     )
 
     return binder, wb_ratio, total_mass
 
 
-def predict_strength(mix, age):
-    data = pd.DataFrame({
-        "Cement": [mix["Cement"]],
-        "Blast Furnace Slag": [mix["Blast Furnace Slag"]],
-        "Fly Ash": [mix["Fly Ash"]],
-        "Water": [mix["Water"]],
-        "Superplasticizer": [mix["Superplasticizer"]],
-        "Coarse Aggregate": [mix["Coarse Aggregate"]],
-        "Fine Aggregate": [mix["Fine Aggregate"]],
-        "Age": [age]
-    })
-
-    prediction = model.predict(data)[0]
-
-    return float(prediction)
-
-
 # ============================================================
-# SIMPLE OPTIMIZATION SEARCH
+# FAST AI OPTIMIZER
 # ============================================================
 
-def optimize_mix(
+def optimize_mix_fast(
     current_mix,
     age,
-    target_strength,
-    current_cost,
-    current_co2
+    target_strength
 ):
 
-    best_mix = None
-    best_score = float("inf")
+    rng = np.random.default_rng(42)
 
-    # --------------------------------------------------------
-    # Search ranges
-    # --------------------------------------------------------
+    N = 25000
 
-    cement_values = np.arange(180, min(current_mix["Cement"], 400) + 1, 10)
+    candidates = pd.DataFrame({
 
-    if len(cement_values) == 0:
-        cement_values = [180]
+        "Cement": rng.uniform(
+            160,
+            max(320, current_mix["Cement"] + 20),
+            N
+        ),
 
-    slag_values = np.arange(0, 151, 15)
-    flyash_values = np.arange(0, 101, 15)
-    water_values = np.arange(120, 221, 10)
-    sp_values = np.arange(0, 11, 2)
+        "Blast Furnace Slag": rng.uniform(
+            0,
+            150,
+            N
+        ),
 
-    # Aggregate values are calculated approximately
-    # to maintain realistic total concrete mass.
+        "Fly Ash": rng.uniform(
+            0,
+            100,
+            N
+        ),
 
-    for cement in cement_values:
+        "Water": rng.uniform(
+            120,
+            210,
+            N
+        ),
 
-        for slag in slag_values:
+        "Superplasticizer": rng.uniform(
+            0,
+            10,
+            N
+        )
+    })
 
-            for fly_ash in flyash_values:
+    candidates["Binder"] = (
+        candidates["Cement"]
+        + candidates["Blast Furnace Slag"]
+        + candidates["Fly Ash"]
+    )
 
-                binder = cement + slag + fly_ash
+    candidates["WB"] = (
+        candidates["Water"]
+        / candidates["Binder"]
+    )
 
-                if binder < 250:
-                    continue
+    target_mass = 2250
 
-                for water in water_values:
+    aggregate_mass = (
+        target_mass
+        - candidates["Cement"]
+        - candidates["Blast Furnace Slag"]
+        - candidates["Fly Ash"]
+        - candidates["Water"]
+        - candidates["Superplasticizer"]
+    )
 
-                    wb_ratio = water / binder
+    candidates["Fine Aggregate"] = (
+        aggregate_mass * 0.43
+    )
 
-                    if wb_ratio > 0.60:
-                        continue
+    candidates["Coarse Aggregate"] = (
+        aggregate_mass * 0.57
+    )
 
-                    for sp in sp_values:
+    candidates["Total Mass"] = (
+        candidates["Cement"]
+        + candidates["Blast Furnace Slag"]
+        + candidates["Fly Ash"]
+        + candidates["Water"]
+        + candidates["Superplasticizer"]
+        + candidates["Coarse Aggregate"]
+        + candidates["Fine Aggregate"]
+    )
 
-                        # Approximate aggregate quantities
-                        remaining_mass = 2200 - (
-                            cement
-                            + slag
-                            + fly_ash
-                            + water
-                            + sp
-                        )
+    valid = (
+        (candidates["Cement"] >= 180)
+        &
+        (candidates["Binder"] >= 250)
+        &
+        (candidates["WB"] <= 0.60)
+        &
+        (candidates["WB"] >= 0.35)
+        &
+        (candidates["Fine Aggregate"] >= 650)
+        &
+        (candidates["Fine Aggregate"] <= 1000)
+        &
+        (candidates["Coarse Aggregate"] >= 850)
+        &
+        (candidates["Coarse Aggregate"] <= 1250)
+        &
+        (candidates["Total Mass"] >= 2200)
+        &
+        (candidates["Total Mass"] <= 2500)
+    )
 
-                        if remaining_mass < 1700:
-                            continue
+    candidates = candidates.loc[
+        valid
+    ].reset_index(drop=True)
 
-                        # Split aggregate approximately 45/55
-                        fine = remaining_mass * 0.45
-                        coarse = remaining_mass * 0.55
+    if len(candidates) == 0:
+        return None
 
-                        # Keep aggregates in reasonable range
-                        if fine < 650 or fine > 1000:
-                            continue
+    candidates["Strength"] = predict_candidates(
+        candidates,
+        age
+    )
 
-                        if coarse < 850 or coarse > 1200:
-                            continue
+    candidates = candidates[
+        candidates["Strength"] >= target_strength
+    ].copy()
 
-                        candidate = {
-                            "Cement": float(cement),
-                            "Blast Furnace Slag": float(slag),
-                            "Fly Ash": float(fly_ash),
-                            "Water": float(water),
-                            "Superplasticizer": float(sp),
-                            "Coarse Aggregate": float(coarse),
-                            "Fine Aggregate": float(fine)
-                        }
+    if len(candidates) == 0:
+        return None
 
-                        binder, wb, total_mass = calculate_properties(candidate)
+    candidates["Cost"] = (
+        candidates["Cement"] * 7.0
+        + candidates["Blast Furnace Slag"] * 2.0
+        + candidates["Fly Ash"] * 2.0
+        + candidates["Water"] * 0.05
+        + candidates["Superplasticizer"] * 80.0
+        + candidates["Coarse Aggregate"] * 1.0
+        + candidates["Fine Aggregate"] * 1.0
+    )
 
-                        # Total mass constraint
-                        if total_mass < 2200 or total_mass > 2500:
-                            continue
+    candidates["CO2"] = (
+        candidates["Cement"] * 0.90
+        + candidates["Blast Furnace Slag"] * 0.07
+        + candidates["Fly Ash"] * 0.02
+        + candidates["Water"] * 0.0003
+        + candidates["Superplasticizer"] * 0.50
+        + candidates["Coarse Aggregate"] * 0.005
+        + candidates["Fine Aggregate"] * 0.005
+    )
 
-                        # ------------------------------------------------
-                        # Predict strength using REAL ML model
-                        # ------------------------------------------------
+    candidates["Strength Excess"] = (
+        candidates["Strength"]
+        - target_strength
+    )
 
-                        strength = predict_strength(candidate, age)
+    def normalize(series):
 
-                        # Required strength
-                        if strength < target_strength:
-                            continue
+        minimum = series.min()
+        maximum = series.max()
 
-                        cost = calculate_cost(candidate)
-                        co2 = calculate_co2(candidate)
+        if maximum == minimum:
+            return pd.Series(
+                np.zeros(len(series)),
+                index=series.index
+            )
 
-                        # ------------------------------------------------
-                        # Prefer a solution that improves current mix
-                        # ------------------------------------------------
+        return (
+            series - minimum
+        ) / (
+            maximum - minimum
+        )
 
-                        cost_saving = max(
-                            0,
-                            current_cost - cost
-                        )
+    candidates["Cement Score"] = normalize(
+        candidates["Cement"]
+    )
 
-                        co2_saving = max(
-                            0,
-                            current_co2 - co2
-                        )
+    candidates["Cost Score"] = normalize(
+        candidates["Cost"]
+    )
 
-                        cement_saving = max(
-                            0,
-                            current_mix["Cement"] - cement
-                        )
+    candidates["CO2 Score"] = normalize(
+        candidates["CO2"]
+    )
 
-                        # Penalize solutions that do not improve
-                        # the current mix.
-                        penalty = 0
+    candidates["Strength Score"] = normalize(
+        candidates["Strength Excess"]
+    )
 
-                        if cost >= current_cost:
-                            penalty += 5000
+    candidates["Score"] = (
+        candidates["Cement Score"] * 0.35
+        + candidates["Cost Score"] * 0.30
+        + candidates["CO2 Score"] * 0.25
+        + candidates["Strength Score"] * 0.10
+    )
 
-                        if co2 >= current_co2:
-                            penalty += 5000
+    best = candidates.loc[
+        candidates["Score"].idxmin()
+    ]
 
-                        if cement >= current_mix["Cement"]:
-                            penalty += 5000
+    return {
+        "Cement": float(best["Cement"]),
+        "Blast Furnace Slag": float(best["Blast Furnace Slag"]),
+        "Fly Ash": float(best["Fly Ash"]),
+        "Water": float(best["Water"]),
+        "Superplasticizer": float(best["Superplasticizer"]),
+        "Coarse Aggregate": float(best["Coarse Aggregate"]),
+        "Fine Aggregate": float(best["Fine Aggregate"]),
+        "Strength": float(best["Strength"]),
+        "Cost": float(best["Cost"]),
+        "CO2": float(best["CO2"]),
+        "Binder": float(best["Binder"]),
+        "WB Ratio": float(best["WB"]),
+        "Total Mass": float(best["Total Mass"])
+    }
 
-                        # ------------------------------------------------
-                        # Objective
-                        # ------------------------------------------------
 
-                        score = (
-                            cost
-                            + co2 * 5
-                            + cement * 2
-                            - strength * 2
-                            - cost_saving * 2
-                            - co2_saving * 2
-                            - cement_saving
-                            + penalty
-                        )
+# ============================================================
+# PDF REPORT
+# ============================================================
 
-                        if score < best_score:
+def create_pdf_report(
+    grade,
+    target_strength,
+    age,
+    slump,
+    current_mix,
+    current_strength,
+    current_binder,
+    current_wb,
+    current_mass,
+    current_cost,
+    current_co2,
+    optimized_mix,
+    cement_saving,
+    binder_saving,
+    cost_saving,
+    co2_saving,
+    cement_pct,
+    binder_pct,
+    cost_pct,
+    co2_pct
+):
 
-                            best_score = score
+    buffer = BytesIO()
 
-                            best_mix = {
-                                **candidate,
-                                "Strength": strength,
-                                "Cost": cost,
-                                "CO2": co2,
-                                "Binder": binder,
-                                "WB Ratio": wb,
-                                "Total Mass": total_mass
-                            }
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=35,
+        leftMargin=35,
+        topMargin=35,
+        bottomMargin=35
+    )
 
-    return best_mix
+    styles = getSampleStyleSheet()
+
+    story = []
+
+    story.append(
+        Paragraph(
+            "AI-Driven Sustainable Concrete Mix Design",
+            styles["Title"]
+        )
+    )
+
+    story.append(
+        Paragraph(
+            "Machine Learning-Based Concrete Strength Prediction "
+            "and Sustainable Mix Optimization",
+            styles["Heading2"]
+        )
+    )
+
+    story.append(Spacer(1, 12))
+
+    story.append(
+        Paragraph(
+            "1. Project Details",
+            styles["Heading2"]
+        )
+    )
+
+    project_data = [
+        ["Project", "AI-Driven Sustainable Concrete Mix Design"],
+        ["Degree", "B.E. Civil Engineering"],
+        ["Student", "Ashyam Haqeel"],
+        ["Institute", "Bearys Institute of Technology, Mangaluru"],
+        ["Selected Grade", grade],
+        ["Target Strength", f"{target_strength:.0f} MPa"],
+        ["Age", f"{age} days"],
+        ["Required Slump", f"{slump:.0f} mm"]
+    ]
+
+    table = Table(
+        project_data,
+        colWidths=[150, 350]
+    )
+
+    table.setStyle(
+        TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("BACKGROUND", (0, 0), (0, -1), colors.lightgrey),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE")
+        ])
+    )
+
+    story.append(table)
+
+    story.append(Spacer(1, 14))
+
+    # CURRENT MIX
+
+    story.append(
+        Paragraph(
+            "2. Current Mix",
+            styles["Heading2"]
+        )
+    )
+
+    materials = [
+        "Cement",
+        "Blast Furnace Slag",
+        "Fly Ash",
+        "Water",
+        "Superplasticizer",
+        "Coarse Aggregate",
+        "Fine Aggregate"
+    ]
+
+    current_data = [
+        ["Material", "Quantity (kg/m3)"]
+    ]
+
+    for name in materials:
+        current_data.append([
+            name,
+            f"{current_mix[name]:.2f}"
+        ])
+
+    table = Table(
+        current_data,
+        colWidths=[280, 220]
+    )
+
+    table.setStyle(
+        TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey)
+        ])
+    )
+
+    story.append(table)
+
+    story.append(Spacer(1, 10))
+
+    current_properties = [
+        ["Parameter", "Current Value"],
+        ["ML Predicted Strength", f"{current_strength:.2f} MPa"],
+        ["Total Binder", f"{current_binder:.2f} kg/m3"],
+        ["Water/Binder Ratio", f"{current_wb:.3f}"],
+        ["Total Mix Mass", f"{current_mass:.2f} kg/m3"],
+        ["Estimated Cost", f"Rs. {current_cost:.2f}/m3"],
+        ["Estimated CO2", f"{current_co2:.2f} kg/m3"]
+    ]
+
+    table = Table(
+        current_properties,
+        colWidths=[280, 220]
+    )
+
+    table.setStyle(
+        TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey)
+        ])
+    )
+
+    story.append(table)
+
+    story.append(Spacer(1, 14))
+
+    # OPTIMIZED MIX
+
+    story.append(
+        Paragraph(
+            "3. AI-Optimized Mix",
+            styles["Heading2"]
+        )
+    )
+
+    optimized_data = [
+        ["Material", "Optimized Quantity (kg/m3)"]
+    ]
+
+    for name in materials:
+        optimized_data.append([
+            name,
+            f"{optimized_mix[name]:.2f}"
+        ])
+
+    table = Table(
+        optimized_data,
+        colWidths=[280, 220]
+    )
+
+    table.setStyle(
+        TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey)
+        ])
+    )
+
+    story.append(table)
+
+    story.append(Spacer(1, 10))
+
+    optimized_properties = [
+        ["Parameter", "Optimized Value"],
+        ["Predicted Strength", f"{optimized_mix['Strength']:.2f} MPa"],
+        ["Target Strength", f"{target_strength:.2f} MPa"],
+        ["Total Binder", f"{optimized_mix['Binder']:.2f} kg/m3"],
+        ["Water/Binder Ratio", f"{optimized_mix['WB Ratio']:.3f}"],
+        ["Total Mix Mass", f"{optimized_mix['Total Mass']:.2f} kg/m3"],
+        ["Estimated Cost", f"Rs. {optimized_mix['Cost']:.2f}/m3"],
+        ["Estimated CO2", f"{optimized_mix['CO2']:.2f} kg/m3"]
+    ]
+
+    table = Table(
+        optimized_properties,
+        colWidths=[280, 220]
+    )
+
+    table.setStyle(
+        TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey)
+        ])
+    )
+
+    story.append(table)
+
+    story.append(Spacer(1, 14))
+
+    # SAVINGS
+
+    story.append(
+        Paragraph(
+            "4. Resource Savings",
+            styles["Heading2"]
+        )
+    )
+
+    savings_data = [
+        ["Parameter", "Saving", "Reduction"],
+        ["Cement", f"{cement_saving:.2f} kg/m3", f"{cement_pct:.1f}%"],
+        ["Binder", f"{binder_saving:.2f} kg/m3", f"{binder_pct:.1f}%"],
+        ["Cost", f"Rs. {cost_saving:.2f}/m3", f"{cost_pct:.1f}%"],
+        ["CO2", f"{co2_saving:.2f} kg/m3", f"{co2_pct:.1f}%"]
+    ]
+
+    table = Table(
+        savings_data,
+        colWidths=[180, 180, 140]
+    )
+
+    table.setStyle(
+        TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey)
+        ])
+    )
+
+    story.append(table)
+
+    story.append(Spacer(1, 14))
+
+    # COMPARISON
+
+    story.append(
+        Paragraph(
+            "5. Current vs Optimized",
+            styles["Heading2"]
+        )
+    )
+
+    comparison_data = [
+        ["Parameter", "Current", "Optimized"],
+        ["Predicted Strength (MPa)", f"{current_strength:.2f}", f"{optimized_mix['Strength']:.2f}"],
+        ["Target Strength (MPa)", f"{target_strength:.2f}", f"{target_strength:.2f}"],
+        ["Cement (kg/m3)", f"{current_mix['Cement']:.2f}", f"{optimized_mix['Cement']:.2f}"],
+        ["Binder (kg/m3)", f"{current_binder:.2f}", f"{optimized_mix['Binder']:.2f}"],
+        ["Water/Binder", f"{current_wb:.3f}", f"{optimized_mix['WB Ratio']:.3f}"],
+        ["Total Mass (kg/m3)", f"{current_mass:.2f}", f"{optimized_mix['Total Mass']:.2f}"],
+        ["Cost (Rs./m3)", f"{current_cost:.2f}", f"{optimized_mix['Cost']:.2f}"],
+        ["CO2 (kg/m3)", f"{current_co2:.2f}", f"{optimized_mix['CO2']:.2f}"]
+    ]
+
+    table = Table(
+        comparison_data,
+        colWidths=[230, 135, 135]
+    )
+
+    table.setStyle(
+        TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey)
+        ])
+    )
+
+    story.append(table)
+
+    story.append(Spacer(1, 14))
+
+    story.append(
+        Paragraph(
+            "6. Engineering Disclaimer",
+            styles["Heading2"]
+        )
+    )
+
+    story.append(
+        Paragraph(
+            "This application is an ML-based academic decision-support "
+            "system. The optimized mix must be verified through laboratory "
+            "trial mixes, workability testing, durability testing and "
+            "applicable concrete design standards before construction use. "
+            "Cost and CO2 values are estimated using academic assumptions. "
+            "Slump is a design requirement and is not predicted by the "
+            "current ML model.",
+            styles["BodyText"]
+        )
+    )
+
+    doc.build(story)
+
+    buffer.seek(0)
+
+    return buffer.getvalue()
 
 
 # ============================================================
 # TITLE
 # ============================================================
 
-st.title("🏗️ AI-Driven Sustainable Concrete Mix Design")
+st.title(
+    "🏗️ AI-Driven Sustainable Concrete Mix Design"
+)
 
-st.markdown("### Machine Learning-Based Concrete Strength Prediction and Mix Optimization")
+st.subheader(
+    "Machine Learning-Based Concrete Strength Prediction "
+    "and Sustainable Mix Optimization"
+)
 
 st.markdown(
     "**Created by: Ashyam Haqeel**  \n"
@@ -293,9 +717,9 @@ st.markdown(
 )
 
 st.write(
-    "This application uses a trained XGBoost machine learning model "
-    "to predict concrete compressive strength and identify a more "
-    "resource-efficient concrete mix."
+    "Enter the current concrete mix. The trained XGBoost model "
+    "predicts its compressive strength, and the AI optimizer "
+    "searches for a more resource-efficient mix."
 )
 
 # ============================================================
@@ -304,110 +728,77 @@ st.write(
 
 st.sidebar.header("🏗️ Concrete Mix Design")
 
-# ============================================================
-# CONCRETE GRADE
-# ============================================================
-
-st.sidebar.subheader("Concrete Grade")
-
 grade = st.sidebar.selectbox(
-    "Select Concrete Grade",
+    "Select Grade",
     ["M20", "M25", "M30", "M35", "M40"],
     index=0
 )
 
 target_strength = {
-    "M20": 20,
-    "M25": 25,
-    "M30": 30,
-    "M35": 35,
-    "M40": 40
+    "M20": 20.0,
+    "M25": 25.0,
+    "M30": 30.0,
+    "M35": 35.0,
+    "M40": 40.0
 }[grade]
 
 st.sidebar.info(
-    f"{grade} target strength = {target_strength} MPa"
+    f"{grade} target = {target_strength:.0f} MPa"
 )
 
 # ============================================================
-# CURRENT MIX INPUT
+# INPUTS
 # ============================================================
 
 st.sidebar.subheader("Current Mix")
 
 cement = st.sidebar.number_input(
     "Cement (kg/m³)",
-    min_value=0.0,
-    max_value=1000.0,
-    value=300.0,
-    step=5.0
+    0.0, 1000.0, 300.0, 5.0
 )
 
 slag = st.sidebar.number_input(
     "Blast Furnace Slag (kg/m³)",
-    min_value=0.0,
-    max_value=400.0,
-    value=100.0,
-    step=5.0
+    0.0, 400.0, 100.0, 5.0
 )
 
 fly_ash = st.sidebar.number_input(
     "Fly Ash (kg/m³)",
-    min_value=0.0,
-    max_value=300.0,
-    value=50.0,
-    step=5.0
+    0.0, 300.0, 50.0, 5.0
 )
 
 water = st.sidebar.number_input(
     "Water (kg/m³)",
-    min_value=0.0,
-    max_value=400.0,
-    value=180.0,
-    step=5.0
+    0.0, 400.0, 180.0, 5.0
 )
 
 superplasticizer = st.sidebar.number_input(
     "Superplasticizer (kg/m³)",
-    min_value=0.0,
-    max_value=50.0,
-    value=5.0,
-    step=0.5
+    0.0, 50.0, 5.0, 0.5
 )
 
 coarse_aggregate = st.sidebar.number_input(
     "Coarse Aggregate (kg/m³)",
-    min_value=0.0,
-    max_value=1500.0,
-    value=1000.0,
-    step=10.0
+    0.0, 1500.0, 1000.0, 10.0
 )
 
 fine_aggregate = st.sidebar.number_input(
     "Fine Aggregate (kg/m³)",
-    min_value=0.0,
-    max_value=1200.0,
-    value=800.0,
-    step=10.0
+    0.0, 1200.0, 800.0, 10.0
 )
 
 age = st.sidebar.number_input(
     "Age (days)",
-    min_value=1,
-    max_value=365,
-    value=28,
-    step=1
+    1, 365, 28, 1
 )
 
 slump = st.sidebar.number_input(
     "Required Slump (mm)",
-    min_value=0.0,
-    max_value=250.0,
-    value=100.0,
-    step=5.0
+    0.0, 250.0, 100.0, 5.0
 )
 
 # ============================================================
-# CURRENT MIX DICTIONARY
+# CURRENT MIX
 # ============================================================
 
 current_mix = {
@@ -426,30 +817,25 @@ current_mix = {
 
 st.divider()
 
-run_button = st.button(
-    "🚀 Analyze & Optimize Concrete Mix",
+analyze = st.button(
+    "🚀 Analyze & Optimize",
     type="primary",
     use_container_width=True
 )
 
 # ============================================================
-# MAIN APPLICATION
+# MAIN
 # ============================================================
 
-if run_button:
-
-    # ========================================================
-    # CURRENT MIX PREDICTION
-    # ========================================================
+if analyze:
 
     current_strength = predict_strength(
         current_mix,
         age
     )
 
-    current_binder, current_wb, current_mass = calculate_properties(
-        current_mix
-    )
+    current_binder, current_wb, current_mass = \
+        calculate_properties(current_mix)
 
     current_cost = calculate_cost(
         current_mix
@@ -460,73 +846,48 @@ if run_button:
     )
 
     # ========================================================
-    # CURRENT MIX RESULTS
+    # CURRENT RESULT
     # ========================================================
 
-    st.header("🤖 Current Mix — AI Prediction")
+    st.header(
+        "🤖 Current Mix — Actual ML Prediction"
+    )
 
     st.success(
         f"Predicted Compressive Strength: "
         f"{current_strength:.2f} MPa"
     )
 
+    st.caption(
+        "This is the actual prediction produced by the trained "
+        "XGBoost model. The value is not forced to equal the "
+        "selected concrete grade."
+    )
+
     col1, col2, col3, col4 = st.columns(4)
 
     col1.metric(
-        "Strength",
+        "Predicted Strength",
         f"{current_strength:.2f} MPa"
     )
 
     col2.metric(
-        "Cost",
-        f"₹{current_cost:.2f}/m³"
+        "Grade Target",
+        f"{target_strength:.0f} MPa"
     )
 
     col3.metric(
-        "CO₂",
-        f"{current_co2:.2f} kg/m³"
+        "Estimated Cost",
+        f"₹{current_cost:.2f}/m³"
     )
 
     col4.metric(
-        "Water/Binder",
-        f"{current_wb:.3f}"
+        "Estimated CO₂",
+        f"{current_co2:.2f} kg/m³"
     )
 
     # ========================================================
-    # CURRENT MIX DETAILS
-    # ========================================================
-
-    st.subheader("📋 Current Mix Composition")
-
-    current_table = pd.DataFrame({
-        "Material": [
-            "Cement",
-            "Blast Furnace Slag",
-            "Fly Ash",
-            "Water",
-            "Superplasticizer",
-            "Coarse Aggregate",
-            "Fine Aggregate"
-        ],
-        "Quantity (kg/m³)": [
-            cement,
-            slag,
-            fly_ash,
-            water,
-            superplasticizer,
-            coarse_aggregate,
-            fine_aggregate
-        ]
-    })
-
-    st.dataframe(
-        current_table,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    # ========================================================
-    # STRENGTH ASSESSMENT
+    # GRADE CHECK
     # ========================================================
 
     st.subheader("🎯 Grade Assessment")
@@ -534,24 +895,45 @@ if run_button:
     if current_strength >= target_strength:
 
         st.success(
-            f"✅ The predicted strength of "
-            f"{current_strength:.2f} MPa meets the "
-            f"{grade} requirement of {target_strength} MPa."
+            f"✅ Current mix satisfies the {grade} target "
+            f"of {target_strength:.0f} MPa."
         )
 
     else:
 
-        st.warning(
-            f"⚠️ The predicted strength of "
-            f"{current_strength:.2f} MPa is below the "
-            f"{grade} requirement of {target_strength} MPa."
+        st.error(
+            f"❌ Current mix is below the {grade} target "
+            f"of {target_strength:.0f} MPa."
         )
+
+    # ========================================================
+    # CURRENT PROPERTIES
+    # ========================================================
+
+    st.subheader("📊 Current Mix Properties")
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric(
+        "Total Binder",
+        f"{current_binder:.2f} kg/m³"
+    )
+
+    col2.metric(
+        "Water/Binder",
+        f"{current_wb:.3f}"
+    )
+
+    col3.metric(
+        "Total Mix Mass",
+        f"{current_mass:.2f} kg/m³"
+    )
 
     # ========================================================
     # SLUMP
     # ========================================================
 
-    st.subheader("📏 Slump Requirement")
+    st.subheader("📏 Workability Requirement")
 
     st.metric(
         "Required Slump",
@@ -559,63 +941,56 @@ if run_button:
     )
 
     st.caption(
-        "Slump is treated as a design requirement. "
-        "The current UCI concrete dataset does not contain "
-        "slump measurements, so slump is not predicted by the ML model."
+        "Slump is treated as an input requirement. The current "
+        "ML dataset does not contain slump data, so this "
+        "application does not predict slump."
     )
 
     # ========================================================
     # OPTIMIZATION
     # ========================================================
 
-    st.header("⚙️ Automatic Sustainable Mix Optimization")
+    st.header("⚙️ Fast AI Mix Optimization")
 
     st.write(
-        f"The optimizer searches for a mix capable of achieving "
-        f"the selected {grade} target of {target_strength} MPa "
-        f"while reducing material use, estimated cost and CO₂ "
-        f"where a feasible solution exists."
+        f"Searching for a mix that achieves at least "
+        f"{target_strength:.0f} MPa while reducing cement, "
+        f"cost and CO₂."
     )
 
     with st.spinner(
-        "🔄 AI is searching for an improved concrete mix..."
+        "🔄 AI is searching for the best feasible mix..."
     ):
 
-        optimized_mix = optimize_mix(
-            current_mix=current_mix,
-            age=age,
-            target_strength=target_strength,
-            current_cost=current_cost,
-            current_co2=current_co2
+        optimized_mix = optimize_mix_fast(
+            current_mix,
+            age,
+            target_strength
         )
 
     # ========================================================
-    # NO SOLUTION
+    # OPTIMIZED RESULT
     # ========================================================
 
     if optimized_mix is None:
 
         st.error(
-            "❌ No feasible optimized mix was found within the "
-            "current search constraints."
+            "❌ No feasible optimized mix was found within "
+            "the current search range."
         )
 
         st.info(
-            "Try increasing the current cement/binder quantities "
-            "or selecting a lower concrete grade."
+            "Try increasing the current cement/binder content "
+            "or selecting a lower grade."
         )
 
     else:
 
-        # ====================================================
-        # OPTIMIZED RESULT
-        # ====================================================
+        st.success("✅ Optimized mix found.")
 
-        st.success(
-            "✅ Optimized concrete mix found."
+        st.header(
+            "🏆 Recommended AI-Optimized Mix"
         )
-
-        st.subheader("🏆 Recommended AI-Optimized Mix")
 
         col1, col2, col3, col4 = st.columns(4)
 
@@ -625,27 +1000,30 @@ if run_button:
         )
 
         col2.metric(
-            "Cost",
-            f"₹{optimized_mix['Cost']:.2f}/m³"
+            "Target",
+            f"{target_strength:.0f} MPa"
         )
 
         col3.metric(
-            "CO₂",
-            f"{optimized_mix['CO2']:.2f} kg/m³"
+            "Estimated Cost",
+            f"₹{optimized_mix['Cost']:.2f}/m³"
         )
 
         col4.metric(
-            "Water/Binder",
-            f"{optimized_mix['WB Ratio']:.3f}"
+            "Estimated CO₂",
+            f"{optimized_mix['CO2']:.2f} kg/m³"
         )
 
         # ====================================================
-        # OPTIMIZED MIX TABLE
+        # MIX TABLE
         # ====================================================
 
-        st.subheader("📋 Optimized Mix Composition")
+        st.subheader(
+            "📋 Optimized Mix Composition"
+        )
 
         optimized_table = pd.DataFrame({
+
             "Material": [
                 "Cement",
                 "Blast Furnace Slag",
@@ -655,15 +1033,17 @@ if run_button:
                 "Coarse Aggregate",
                 "Fine Aggregate"
             ],
+
             "Current (kg/m³)": [
-                current_mix["Cement"],
-                current_mix["Blast Furnace Slag"],
-                current_mix["Fly Ash"],
-                current_mix["Water"],
-                current_mix["Superplasticizer"],
-                current_mix["Coarse Aggregate"],
-                current_mix["Fine Aggregate"]
+                cement,
+                slag,
+                fly_ash,
+                water,
+                superplasticizer,
+                coarse_aggregate,
+                fine_aggregate
             ],
+
             "Optimized (kg/m³)": [
                 optimized_mix["Cement"],
                 optimized_mix["Blast Furnace Slag"],
@@ -682,128 +1062,135 @@ if run_button:
         )
 
         # ====================================================
-        # OPTIMIZED MIX PROPERTIES
+        # OPTIMIZED PROPERTIES
         # ====================================================
 
-        st.subheader("📊 Optimized Mix Performance")
+        st.subheader(
+            "📊 Optimized Mix Properties"
+        )
 
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
 
         col1.metric(
-            "Total Binder",
+            "Binder",
             f"{optimized_mix['Binder']:.2f} kg/m³"
         )
 
         col2.metric(
-            "Total Mix Mass",
-            f"{optimized_mix['Total Mass']:.2f} kg/m³"
+            "Water/Binder",
+            f"{optimized_mix['WB Ratio']:.3f}"
         )
 
         col3.metric(
+            "Total Mass",
+            f"{optimized_mix['Total Mass']:.2f} kg/m³"
+        )
+
+        col4.metric(
             "Strength",
             f"{optimized_mix['Strength']:.2f} MPa"
         )
 
         # ====================================================
-        # SAVINGS CALCULATION
+        # SAVINGS
         # ====================================================
 
         cement_saving = (
-            current_mix["Cement"]
-            - optimized_mix["Cement"]
-        )
-
-        cost_saving = (
-            current_cost
-            - optimized_mix["Cost"]
-        )
-
-        co2_saving = (
-            current_co2
-            - optimized_mix["CO2"]
+            cement - optimized_mix["Cement"]
         )
 
         binder_saving = (
-            current_binder
-            - optimized_mix["Binder"]
+            current_binder - optimized_mix["Binder"]
         )
 
-        mass_saving = (
-            current_mass
-            - optimized_mix["Total Mass"]
+        cost_saving = (
+            current_cost - optimized_mix["Cost"]
         )
 
-        # Percentage savings
-        cement_saving_pct = (
+        co2_saving = (
+            current_co2 - optimized_mix["CO2"]
+        )
+
+        cement_pct = (
             cement_saving / cement * 100
             if cement > 0 else 0
         )
 
-        cost_saving_pct = (
+        binder_pct = (
+            binder_saving / current_binder * 100
+            if current_binder > 0 else 0
+        )
+
+        cost_pct = (
             cost_saving / current_cost * 100
             if current_cost > 0 else 0
         )
 
-        co2_saving_pct = (
+        co2_pct = (
             co2_saving / current_co2 * 100
             if current_co2 > 0 else 0
-        )
-
-        binder_saving_pct = (
-            binder_saving / current_binder * 100
-            if current_binder > 0 else 0
         )
 
         # ====================================================
         # RESOURCE SAVINGS
         # ====================================================
 
-        st.header("🌱 Resource & Sustainability Savings")
+        st.header(
+            "🌱 Resource Savings"
+        )
 
         col1, col2, col3, col4 = st.columns(4)
 
         col1.metric(
-            "Cement Reduction",
+            "Cement Saving",
             f"{cement_saving:.2f} kg/m³",
-            f"{cement_saving_pct:.1f}%"
+            f"{cement_pct:.1f}%"
         )
 
         col2.metric(
-            "Cost Saving",
-            f"₹{cost_saving:.2f}/m³",
-            f"{cost_saving_pct:.1f}%"
+            "Binder Saving",
+            f"{binder_saving:.2f} kg/m³",
+            f"{binder_pct:.1f}%"
         )
 
         col3.metric(
-            "CO₂ Reduction",
-            f"{co2_saving:.2f} kg/m³",
-            f"{co2_saving_pct:.1f}%"
+            "Cost Saving",
+            f"₹{cost_saving:.2f}/m³",
+            f"{cost_pct:.1f}%"
         )
 
         col4.metric(
-            "Binder Reduction",
-            f"{binder_saving:.2f} kg/m³",
-            f"{binder_saving_pct:.1f}%"
+            "CO₂ Saving",
+            f"{co2_saving:.2f} kg/m³",
+            f"{co2_pct:.1f}%"
         )
 
         # ====================================================
         # COMPARISON
         # ====================================================
 
-        st.header("📈 Current vs Optimized Mix")
+        st.header(
+            "📈 Current vs Optimized"
+        )
 
         comparison = pd.DataFrame({
+
             "Parameter": [
+                "Grade",
                 "Predicted Strength (MPa)",
+                "Target Strength (MPa)",
                 "Cement (kg/m³)",
-                "Total Binder (kg/m³)",
-                "Water/Binder Ratio",
-                "Total Mix Mass (kg/m³)",
-                "Estimated Cost (₹/m³)",
-                "Estimated CO₂ (kg/m³)"
+                "Binder (kg/m³)",
+                "Water/Binder",
+                "Total Mass (kg/m³)",
+                "Cost (₹/m³)",
+                "CO₂ (kg/m³)"
             ],
-            "Current Mix": [
+
+            "Current": [
+                grade,
                 current_strength,
+                target_strength,
                 cement,
                 current_binder,
                 current_wb,
@@ -811,8 +1198,11 @@ if run_button:
                 current_cost,
                 current_co2
             ],
-            "Optimized Mix": [
+
+            "Optimized": [
+                grade,
                 optimized_mix["Strength"],
+                target_strength,
                 optimized_mix["Cement"],
                 optimized_mix["Binder"],
                 optimized_mix["WB Ratio"],
@@ -829,80 +1219,106 @@ if run_button:
         )
 
         # ====================================================
-        # FINAL ASSESSMENT
+        # FINAL RECOMMENDATION
         # ====================================================
 
-        st.header("🎯 Optimization Result")
+        st.header(
+            "🎯 Final Recommendation"
+        )
 
-        if optimized_mix["Strength"] >= target_strength:
-
-            st.success(
-                f"✅ Optimized mix achieves the {grade} target. "
-                f"Predicted strength = "
-                f"{optimized_mix['Strength']:.2f} MPa."
-            )
-
-        else:
-
-            st.warning(
-                "⚠️ Optimized mix did not achieve the required target."
-            )
+        st.success(
+            f"Recommended {grade} mix\n\n"
+            f"Predicted strength = "
+            f"{optimized_mix['Strength']:.2f} MPa\n\n"
+            f"Required strength = "
+            f"{target_strength:.0f} MPa"
+        )
 
         if (
-            optimized_mix["Cost"] < current_cost
+            optimized_mix["Cement"] < cement
+            and optimized_mix["Cost"] < current_cost
             and optimized_mix["CO2"] < current_co2
-            and optimized_mix["Cement"] < cement
         ):
 
             st.success(
                 "🌱 The optimized mix reduces cement, estimated "
-                "cost and estimated CO₂ compared with the current mix."
+                "cost and estimated CO₂ while meeting the selected "
+                "strength target."
             )
 
         else:
 
             st.info(
-                "ℹ️ The optimizer found the best feasible solution "
-                "within the defined constraints, but all resource "
-                "indicators may not be lower than the current mix."
+                "ℹ️ A feasible mix was found, but reducing all "
+                "resources simultaneously is not guaranteed for "
+                "every starting mix."
             )
 
         # ====================================================
-        # IMPORTANT ENGINEERING DISCLAIMER
+        # PDF DOWNLOAD
+        # ====================================================
+
+        st.divider()
+
+        st.header(
+            "📄 Download Complete PDF Report"
+        )
+
+        pdf_file = create_pdf_report(
+            grade,
+            target_strength,
+            age,
+            slump,
+            current_mix,
+            current_strength,
+            current_binder,
+            current_wb,
+            current_mass,
+            current_cost,
+            current_co2,
+            optimized_mix,
+            cement_saving,
+            binder_saving,
+            cost_saving,
+            co2_saving,
+            cement_pct,
+            binder_pct,
+            cost_pct,
+            co2_pct
+        )
+
+        st.download_button(
+            label="📄 Download PDF Report",
+            data=pdf_file,
+            file_name=f"{grade}_AI_Concrete_Mix_Report.pdf",
+            mime="application/pdf",
+            type="primary",
+            use_container_width=True
+        )
+
+        st.caption(
+            "The PDF contains the current mix, actual XGBoost "
+            "prediction, optimized mix, cost, CO₂ and savings."
+        )
+
+        # ====================================================
+        # DISCLAIMER
         # ====================================================
 
         st.warning(
-            "⚠️ Engineering Disclaimer: This application provides "
-            "ML-based prediction and academic optimization only. "
-            "The optimized mix must be verified through laboratory "
-            "trial mixes, workability testing, durability checks and "
-            "applicable concrete design standards before construction use."
+            "⚠️ Engineering Disclaimer: This application is an "
+            "ML-based academic decision-support system. The "
+            "optimized mix must be verified through laboratory "
+            "trial mixes, workability testing, durability testing "
+            "and applicable concrete design standards before "
+            "construction use."
         )
 
 # ============================================================
-# PROJECT INFORMATION
+# FOOTER
 # ============================================================
 
 st.divider()
-
-st.subheader("📚 Project Information")
-
-st.write(
-    "**Dataset:** UCI Concrete Compressive Strength Dataset"
-)
-
-st.write(
-    "**Machine Learning Model:** Optimized XGBoost Regressor"
-)
-
-st.write(
-    "**Optimization Goal:** Strength + Cost + CO₂ + Resource Efficiency"
-)
-
-st.write(
-    "**Explainability:** SHAP-based model interpretation "
-    "can be integrated into the next version."
-)
 
 st.caption(
     "AI-Driven Sustainable Concrete Mix Design | "
