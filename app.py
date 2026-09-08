@@ -1,4 +1,5 @@
 import streamlit as st
+st.image("college_logo.png", width=500)
 import pandas as pd
 import numpy as np
 from xgboost import XGBRegressor
